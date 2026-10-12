@@ -1,19 +1,19 @@
-from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
+
 import os
-import time
-import uuid
+from pathlib import Path
+
 import yaml
 from dotenv import dotenv_values
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-# Allow the grader/browser to make cross-origin requests
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["*"],
+    allow_methods=["GET", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -26,80 +26,84 @@ DEFAULTS = {
 }
 
 
-def to_bool(value):
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in {"true", "1", "yes", "on"}
+def load_config():
+    config = DEFAULTS.copy()
+
+    # Layer 2: environment-specific YAML
+    env_name = os.environ.get("APP_ENV", "development")
+    yaml_path = Path(f"config.{env_name}.yaml")
+
+    if yaml_path.exists():
+        with yaml_path.open("r", encoding="utf-8") as f:
+            yaml_config = yaml.safe_load(f) or {}
+        config.update(yaml_config)
+
+    # Layer 3: separate .env file
+    env_file = dotenv_values(".env")
+
+    dotenv_mapping = {
+        "APP_PORT": "port",
+        "NUM_WORKERS": "workers",
+        "APP_DEBUG": "debug",
+        "APP_LOG_LEVEL": "log_level",
+        "APP_API_KEY": "api_key",
+    }
+
+    for env_key, key in dotenv_mapping.items():
+        if env_file.get(env_key) is not None:
+            config[key] = env_file[env_key]
+
+    # Layer 4: OS environment variables
+    os_mapping = {
+        "APP_PORT": "port",
+        "APP_WORKERS": "workers",
+        "APP_DEBUG": "debug",
+        "APP_LOG_LEVEL": "log_level",
+        "APP_API_KEY": "api_key",
+    }
+
+    for env_key, key in os_mapping.items():
+        if env_key in os.environ:
+            config[key] = os.environ[env_key]
+
+    return config
 
 
 def coerce(key, value):
-    if key in {"port", "workers"}:
+    if key in ("port", "workers"):
         return int(value)
+
     if key == "debug":
-        return to_bool(value)
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in (
+            "true", "1", "yes", "on"
+        )
+
     return str(value)
 
 
 @app.get("/effective-config")
-async def effective_config(
-    set: list[str] | None = Query(default=None)
-):
-    config = DEFAULTS.copy()
+async def effective_config(request: Request):
+    config = load_config()
 
-    # Layer 2: environment-specific YAML
-    if os.path.exists("config.development.yaml"):
-        with open("config.development.yaml", "r") as f:
-            yaml_config = yaml.safe_load(f) or {}
-
-        for key, value in yaml_config.items():
-            config[key] = value
-
-    # Layer 3: .env
-    env_file = dotenv_values(".env")
-
-    for key, value in env_file.items():
-        if value is None:
+    # Layer 5: query-string overrides
+    for item in request.query_params.getlist("set"):
+        if "=" not in item:
             continue
 
-        if key == "APP_PORT":
-            config["port"] = value
-        elif key == "NUM_WORKERS":
-            config["workers"] = value
-        elif key == "APP_LOG_LEVEL":
-            config["log_level"] = value
-        elif key == "APP_API_KEY":
-            config["api_key"] = value
-        elif key.startswith("APP_"):
-            config[key[4:].lower()] = value
+        key, value = item.split("=", 1)
 
-    # Layer 4: OS environment variables
-    for key, value in os.environ.items():
-        if not key.startswith("APP_"):
-            continue
-
-        name = key[4:].lower()
-
-        if name == "workers":
-            config["workers"] = value
-        else:
-            config[name] = value
-
-    # Layer 5: CLI/query overrides
-    if set:
-        for item in set:
-            if "=" not in item:
-                continue
-
-            key, value = item.split("=", 1)
+        if key in config:
             config[key] = value
 
-    # Apply required types
-    result = {
-        "port": coerce("port", config["port"]),
-        "workers": coerce("workers", config["workers"]),
-        "debug": coerce("debug", config["debug"]),
-        "log_level": coerce("log_level", config["log_level"]),
-        "api_key": "****",
+    # Apply required data types
+    config = {
+        key: coerce(key, value)
+        for key, value in config.items()
     }
 
-    return result
+    # Never expose the real API key
+    config["api_key"] = "****"
+
+    return config
