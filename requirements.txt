@@ -1,4 +1,4 @@
 fastapi
-uvicorn[standard]
-PyYAML
+uvicorn
+pyyaml
 python-dotenv
